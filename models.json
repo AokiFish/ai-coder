@@ -1,0 +1,23 @@
+{
+  "default": "auto",
+  "models": {
+    "auto":     {"model": "openrouter/free",                "max_tokens": 4000},
+    "glm":      {"model": "z-ai/glm-5.2:free",              "max_tokens": 4000},
+    "deepseek": {"model": "deepseek/deepseek-v4-flash:free", "max_tokens": 4000},
+    "kimi":     {"model": "moonshotai/kimi-k2.6:free",      "max_tokens": 4000},
+    "cobuddy":  {"model": "baidu/cobuddy:free",             "max_tokens": 4000},
+    "gptoss":   {"model": "openai/gpt-oss-20b:free",        "max_tokens": 4000}
+  },
+  "base_url": "https://openrouter.ai/api/v1",
+  "api_key_env": "OPENROUTER_API_KEY",
+  "settings": {
+    "context_limit_chars": 60000,
+    "keep_recent_turns": 3,
+    "auto_commit": true,
+    "command_timeout": 60,
+    "max_steps": 25,
+    "retries": 2,
+    "retry_wait": 3,
+    "fallback_models": ["auto", "glm", "deepseek"]
+  }
+}
