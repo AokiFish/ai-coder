@@ -2,7 +2,10 @@
 import json
 import os
 import urllib.request
+import re
 import uuid
+
+import textproto
 
 DEFAULT_SETTINGS = {
     "context_limit_chars": 60000,  # 历史超过这个字符数就触发压缩
@@ -135,48 +138,75 @@ def fetch_free_models(opener=urllib.request.urlopen):
     return sorted(out, key=lambda x: -x["context"])
 
 
+TRANSIENT_WORDS = ("rate limit", "too many requests", "overloaded", "temporarily",
+                   "upstream error", "try again", "capacity")
+
+
 def classify_error(e):
     """决定出错后怎么办: retry=等一下重试 / switch=换模型 / fatal=直接报错。"""
     code = getattr(e, "status_code", None)
+    if not isinstance(code, int):
+        c2 = getattr(e, "code", None)       # 流式传输中途的错误只带 code，没有 status_code
+        code = c2 if isinstance(c2, int) else None
     msg = str(e).lower()
     if code in (401, 402, 403):
         return "fatal"          # key 无效或无权限，换模型也没用
-    if code in (408, 429, 500, 502, 503, 504) or "rate limit" in msg:
-        return "retry"          # 免费模型最常见：限流
+    if code in (408, 429, 500, 502, 503, 504, 529) or any(w in msg for w in TRANSIENT_WORDS):
+        return "retry"          # 免费模型最常见：限流、上游过载
     if code in (400, 404) or "tool" in msg:
-        return "switch"         # 模型下线/不支持工具调用
-    if code is None and (isinstance(e, (OSError, TimeoutError)) or "connection" in msg or "timeout" in msg):
-        return "retry"
-    return "fatal"
+        return "switch"         # 模型下线/不再免费/不支持工具调用
+    if code is None and (isinstance(e, (OSError, TimeoutError)) or "connection" in msg
+                         or "timeout" in msg or type(e).__module__.startswith("openai")):
+        return "retry"          # openai 库抛出的其他无状态码错误，多半是网络或上游临时故障
+    return "fatal"              # 其余多半是程序自身的 bug，别掩盖
 
 
-def complete(client, mcfg, system, messages, tools=None, stream=True, on_text=None):
-    """调用一次模型。返回 {"content": str, "tool_calls": [{"id","name","arguments"}]}"""
+def tools_unsupported(e):
+    """错误是否表示"这个模型/提供商不支持工具调用"（用于自动切到文本协议）。"""
+    return bool(re.search(r"support\w*\s+(tool|function)|tool use|tool calling|function calling",
+                          str(e).lower()))
+
+
+def complete(client, mcfg, system, messages, tools=None, stream=True, on_text=None,
+             tool_mode="native"):
+    """调用一次模型。
+    返回 {"content", "tool_calls": [{"id","name","arguments"}], "finish_reason", "truncated"}"""
+    use_text = bool(tools) and tool_mode == "text"
+    if use_text:
+        system = system + "\n\n" + textproto.protocol_prompt(tools)
+        messages = textproto.to_text_messages(messages)
     kwargs = dict(
         model=mcfg["model"],
-        max_tokens=mcfg.get("max_tokens", 4000),
+        max_tokens=mcfg.get("max_tokens", 8000),
         messages=[{"role": "system", "content": system}] + messages,
     )
-    if tools:
+    if tools and not use_text:
         kwargs["tools"] = tools
 
     if not stream:
-        m = client.chat.completions.create(**kwargs).choices[0].message
+        choice = client.chat.completions.create(**kwargs).choices[0]
+        m = choice.message
         calls = [{"id": t.id, "name": t.function.name,
                   "arguments": t.function.arguments or "{}"}
                  for t in (m.tool_calls or [])]
-        return {"content": m.content or "", "tool_calls": calls}
+        return {"content": m.content or "", "tool_calls": calls,
+                "finish_reason": getattr(choice, "finish_reason", None), "truncated": False}
 
-    text, calls = [], {}
+    filt = textproto.TextFilter(on_text) if use_text else None
+    emit = filt.feed if use_text else on_text
+    text, calls, finish = [], {}, None
     for chunk in client.chat.completions.create(stream=True, **kwargs):
         if not chunk.choices:
             continue
-        delta = chunk.choices[0].delta
+        choice = chunk.choices[0]
+        if getattr(choice, "finish_reason", None):
+            finish = choice.finish_reason
+        delta = choice.delta
         if getattr(delta, "content", None):
             text.append(delta.content)
-            if on_text:
-                on_text(delta.content)
-        # 工具调用是"碎片"流式到达的，要按 index 拼起来
+            if emit:
+                emit(delta.content)
+        # 原生工具调用是"碎片"流式到达的，要按 index 拼起来
         for tc in getattr(delta, "tool_calls", None) or []:
             c = calls.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
             if tc.id:
@@ -186,10 +216,19 @@ def complete(client, mcfg, system, messages, tools=None, stream=True, on_text=No
                     c["name"] = tc.function.name
                 if tc.function.arguments:
                     c["arguments"] += tc.function.arguments
-    ordered = [calls[i] for i in sorted(calls)]
+    if filt:
+        filt.flush()
+    full = "".join(text)
+    truncated = False
+    if use_text:
+        full, parsed, truncated = textproto.parse(full)
+        ordered = [{"id": "", "name": n, "arguments": json.dumps(a, ensure_ascii=False)}
+                   for n, a in parsed]
+    else:
+        ordered = [calls[i] for i in sorted(calls)]
     for i, c in enumerate(ordered):
         if not c["id"]:
             c["id"] = f"call_{i}_{uuid.uuid4().hex[:8]}"
         if not c["arguments"]:
             c["arguments"] = "{}"
-    return {"content": "".join(text), "tool_calls": ordered}
+    return {"content": full, "tool_calls": ordered, "finish_reason": finish, "truncated": truncated}

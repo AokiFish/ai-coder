@@ -26,14 +26,24 @@ BASE_PROMPT = """你是一个严谨的编程助手，通过工具在用户的项
 工作原则：
 1. 先了解再动手：用 list_files / grep / read_file 看清现状，不要凭空猜测文件内容。
 2. 小改动用 edit_file，新建文件或大幅重写才用 write_file。
-3. 写完代码后，用 run_command 运行或测试来验证；报错就读错误、自己修，直到通过。
+3. 写完代码后，用 run_command 验证；报错就读错误、自己修，直到通过。
+   不要直接运行会弹窗口或无限循环的程序（游戏、GUI、服务器），它会卡住；
+   这类程序用 python -m py_compile 检查语法，或写不依赖窗口的小测试来验证逻辑。
+   缺少第三方库时，告诉用户需要 pip install 什么，不要自己反复尝试。
 4. 回答简洁，说明你做了什么、结果如何。无法完成时如实说明。"""
+
+TRUNCATED_HINT = ("你的上一条回复因长度限制在工具调用中途被截断，该调用没有执行。"
+                  "请把内容拆小：先用 write_file 写出不超过 120 行的骨架，再用 edit_file 分段补充。")
+TRUNCATED_ARGS = "错误: 你的输出因长度限制被截断，工具参数不完整，未执行。" + \
+                 "请把内容拆小：先用 write_file 写不超过 120 行的骨架，再用 edit_file 分段补充。"
+BAD_ARGS = "错误: 工具参数不是合法 JSON，未执行。请重新调用，并正确转义换行和引号。"
 
 PLAN_SUFFIX = """【计划模式】你现在只能读取和搜索，不能修改任何东西。
 请调研后输出一份清晰的分步计划（要改哪些文件、怎么改、如何验证），等待用户批准。"""
 
 HELP = """命令:
   /model [名称]   查看/切换模型（可填 models.json 里的名字，或任意 :free 模型 ID）
+  /toolmode [native|text]  查看/设置当前模型的工具调用方式（text=文本协议，适合不支持原生工具调用的模型）
   /models         联网列出当前可用的免费模型（支持工具调用）
   /plan 任务      先出计划，你批准后再执行
   /compact        立即压缩历史对话
@@ -47,6 +57,17 @@ def color(text, code):
     if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
         return text
     return f"\033[{code}m{text}\033[0m"
+
+
+def preview(name, result, max_lines=10):
+    """工具结果在终端里的预览。命令失败时显示输出末尾（报错信息通常在最后），
+    否则只显示第一行，避免刷屏。"""
+    lines = result.strip().split("\n")
+    if name == "run_command" and not result.startswith("exit_code=0") and len(lines) > 1:
+        body = lines[1:]
+        shown = [lines[0]] + (["..."] if len(body) > max_lines else []) + body[-max_lines:]
+        return [l[:200] for l in shown]
+    return [lines[0][:150]]
 
 
 def ask_yes_no(prompt):
@@ -80,6 +101,8 @@ class Agent:
         self.history = memory.History(os.path.join(self.root, "history.jsonl"))
         self.messages = self.history.load()
         self.agent_commits = []
+        # 工具模式: native=原生 function calling / text=文本协议
+        self.tool_modes = {n: m.get("tool_mode", "native") for n, m in cfg["models"].items()}
         self.sleep = time.sleep                  # 可替换，方便测试
         self.fetch_models = llm.fetch_free_models
 
@@ -93,7 +116,8 @@ class Agent:
             for attempt in range(self.settings["retries"] + 1):
                 try:
                     res = llm.complete(self.client, models[name], self.system_prompt(),
-                                       self.messages, self.tools.schemas(readonly), on_text=on_text)
+                                       self.messages, self.tools.schemas(readonly), on_text=on_text,
+                                       tool_mode=self.tool_modes.get(name, "native"))
                     if name != self.current:
                         print(color(f"（本次由备用模型 {name} 完成）", "2"))
                     return res
@@ -105,12 +129,18 @@ class Agent:
                     self.log.warning("model %s failed (%s): %s", name, kind, e)
                     if kind == "fatal":
                         raise
+                    # 模型不支持原生工具调用 → 同一个模型改用文本协议重试，而不是直接放弃
+                    if llm.tools_unsupported(e) and self.tool_modes.get(name, "native") == "native":
+                        self.tool_modes[name] = "text"
+                        print(color(f"\n（{name} 不支持原生工具调用，自动改用文本协议重试）", "33"))
+                        continue
                     if kind == "retry" and attempt < self.settings["retries"]:
                         wait = self.settings["retry_wait"] * 2 ** attempt
                         print(color(f"\n（{name} 繁忙或限流，{wait} 秒后重试…）", "33"))
                         self.sleep(wait)
                         continue
-                    print(color(f"\n（{name} 暂不可用: {str(e)[:80]}，尝试下一个模型）", "33"))
+                    hint = "（该模型已不再免费）" if "unavailable for free" in str(e) else ""
+                    print(color(f"\n（{name} 暂不可用{hint}: {str(e)[:200]}\n  → 尝试下一个模型）", "33"))
                     break
         raise last
 
@@ -132,7 +162,7 @@ class Agent:
 
     def repair(self):
         fixed = memory.sanitize(self.messages)
-        if len(fixed) != len(self.messages):
+        if fixed != self.messages:
             self.messages = fixed
             self.history.rewrite(fixed)
 
@@ -176,6 +206,16 @@ class Agent:
             if started:
                 print()
             calls = res["tool_calls"]
+            cut_off = res.get("finish_reason") == "length"
+            # 参数不是合法 JSON（常见原因：输出被 max_tokens 截断）。
+            # 历史里必须存合法 JSON，否则之后每次请求都会被服务端拒绝（400）
+            parsed = []
+            for c in calls:
+                try:
+                    parsed.append(json.loads(c["arguments"] or "{}"))
+                except json.JSONDecodeError:
+                    parsed.append(None)
+                    c["raw"], c["arguments"] = c["arguments"], "{}"
             record = {"role": "assistant",
                       "content": res["content"] or (None if calls else "")}
             if calls:
@@ -184,20 +224,25 @@ class Agent:
                      "function": {"name": c["name"], "arguments": c["arguments"]}}
                     for c in calls]
             self.add(record)
+            if res.get("truncated"):       # 文本协议：工具块写到一半被截断
+                print(color("（输出被长度限制截断，已提示模型拆小后重试）", "33"))
+                self.add({"role": "user", "content": TRUNCATED_HINT})
+                continue
             if not calls:
+                if cut_off:
+                    print(color("（回答因长度限制被截断，可输入“继续”）", "33"))
                 break
-            for c in calls:
-                try:
-                    args = json.loads(c["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    args = None
-                shown = json.dumps(args, ensure_ascii=False)[:120] if args is not None else c["arguments"][:120]
+            for c, args in zip(calls, parsed):
+                shown = (json.dumps(args, ensure_ascii=False) if args is not None
+                         else c["raw"])[:120]
                 print(color(f"  🔧 {c['name']} {shown}", "2"))
-                result = ("错误: 参数不是合法 JSON" if args is None
-                          else self.tools.run(c["name"], args, readonly))
+                if args is None:
+                    result = TRUNCATED_ARGS if cut_off else BAD_ARGS
+                else:
+                    result = self.tools.run(c["name"], args, readonly)
                 self.log.info("tool %s -> %s", c["name"], result[:200].replace("\n", " "))
-                first = result.strip().split("\n")[0][:150]
-                print(color(f"     ↳ {first}", "2"))
+                for line in preview(c["name"], result):
+                    print(color(f"     ↳ {line}", "2"))
                 self.add({"role": "tool", "tool_call_id": c["id"], "content": result})
         else:
             print(color(f"（已达到单轮最大步数 {self.settings['max_steps']}，已停止）", "33"))
@@ -251,13 +296,20 @@ class Agent:
                 self.current = arg
                 print("已切换到", arg)
             elif arg and llm.is_free(arg):          # 直接填任意免费模型 ID
-                self.cfg["models"][arg] = {"model": arg, "max_tokens": 4000}
+                self.cfg["models"][arg] = {"model": arg, "max_tokens": 8000}
+                self.tool_modes.setdefault(arg, "native")
                 self.current = arg
                 print("已切换到", arg)
             elif arg:
                 print("本项目只支持免费模型（ID 以 :free 结尾，或 openrouter/free）")
             else:
                 print("当前:", self.current, "| 可选:", ", ".join(self.cfg["models"]))
+        elif cmd == "/toolmode":
+            if arg in ("native", "text"):
+                self.tool_modes[self.current] = arg
+                print(f"{self.current} 的工具调用方式 → {arg}")
+            else:
+                print(f"{self.current} 当前: {self.tool_modes.get(self.current, 'native')}（可选 native / text）")
         elif cmd == "/models":
             try:
                 found = self.fetch_models()

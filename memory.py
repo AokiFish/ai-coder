@@ -1,4 +1,5 @@
 """memory.py —— 对话记忆：history.jsonl 存取、修复、压缩。"""
+import copy
 import json
 import os
 
@@ -23,7 +24,7 @@ class History:
                         except json.JSONDecodeError:
                             pass  # 跳过损坏行
         fixed = sanitize(msgs)
-        if len(fixed) != len(msgs):
+        if fixed != msgs:
             self.rewrite(fixed)
         return fixed
 
@@ -40,8 +41,16 @@ class History:
 
 
 def sanitize(msgs):
-    """修复被中断的历史：末尾"调用了工具但结果不全"的记录会让 API 报错。"""
-    msgs = [m for m in msgs if isinstance(m, dict) and "role" in m]
+    """修复历史，避免 API 报错：
+    1) 工具参数不是合法 JSON（比如输出被截断）→ 改成 {}，否则之后每次请求都会 400
+    2) 末尾"调用了工具但结果不全"的记录 → 删掉"""
+    msgs = [copy.deepcopy(m) for m in msgs if isinstance(m, dict) and "role" in m]
+    for m in msgs:
+        for t in m.get("tool_calls") or []:
+            try:
+                json.loads(t["function"]["arguments"] or "{}")
+            except (json.JSONDecodeError, TypeError, KeyError):
+                t["function"]["arguments"] = "{}"
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i]
         if m["role"] == "assistant" and m.get("tool_calls"):

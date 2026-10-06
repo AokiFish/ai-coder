@@ -1,12 +1,8 @@
 {
   "default": "auto",
   "models": {
-    "auto":     {"model": "openrouter/free",                "max_tokens": 4000},
-    "glm":      {"model": "z-ai/glm-5.2:free",              "max_tokens": 4000},
-    "deepseek": {"model": "deepseek/deepseek-v4-flash:free", "max_tokens": 4000},
-    "kimi":     {"model": "moonshotai/kimi-k2.6:free",      "max_tokens": 4000},
-    "cobuddy":  {"model": "baidu/cobuddy:free",             "max_tokens": 4000},
-    "gptoss":   {"model": "openai/gpt-oss-20b:free",        "max_tokens": 4000}
+    "auto":     {"model": "openrouter/free", "max_tokens": 8000},
+    "nemotron": {"model": "nvidia/nemotron-3-ultra-550b-a55b:free", "max_tokens": 8000, "tool_mode": "native"}
   },
   "base_url": "https://openrouter.ai/api/v1",
   "api_key_env": "OPENROUTER_API_KEY",
@@ -18,6 +14,6 @@
     "max_steps": 25,
     "retries": 2,
     "retry_wait": 3,
-    "fallback_models": ["auto", "glm", "deepseek"]
+    "fallback_models": ["auto"]
   }
 }

@@ -11,7 +11,7 @@ import unittest
 from types import SimpleNamespace as NS
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import git_util, llm, memory  # noqa: E402
+import git_util, llm, memory, textproto  # noqa: E402
 from agent import Agent  # noqa: E402
 from tools import Tools, check_command  # noqa: E402
 
@@ -28,11 +28,18 @@ class FakeClient:
         if "error" in item:
             raise item["error"]
         text, tools = item.get("text", ""), item.get("tools", [])
+        raw = item.get("raw_tools", [])      # [(name, 原始参数字符串)]，可构造非法 JSON
+        finish = item.get("finish")
         if not kw.get("stream"):
             tcs = [NS(id=f"t{i}", function=NS(name=n, arguments=json.dumps(a)))
                    for i, (n, a) in enumerate(tools)]
             return NS(choices=[NS(message=NS(content=text, tool_calls=tcs or None))])
         chunks = [NS(choices=[])]  # 模拟 usage 空块
+        for j, (n, rawargs) in enumerate(raw):
+            chunks.append(NS(choices=[NS(delta=NS(content=None, tool_calls=[
+                NS(index=j, id=f"r{j}", function=NS(name=n, arguments=rawargs))]))]))
+        if finish:
+            chunks.append(NS(choices=[NS(delta=NS(content=None, tool_calls=None), finish_reason=finish)]))
         half = len(text) // 2
         for part in (text[:half], text[half:]):
             if part:
@@ -227,6 +234,26 @@ class TestAgentLoop(Base):
         self.assertIn("ZeroDivisionError", tool_msgs[1])
         self.assertIn("exit_code=0", tool_msgs[3])
 
+    def test_failed_command_shows_error_in_terminal(self):
+        """回归：命令失败时只显示 exit_code=1，用户看不到真正的报错原因"""
+        cmd = f'"{sys.executable}" -c "raise ValueError(\'xyz出错了\')"'
+        a = self.agent([{"tools": [("run_command", {"command": cmd})]}, {"text": "看到了"}])
+        a.run_turn("运行")
+        out = self.out.getvalue()
+        self.assertIn("exit_code=1", out)
+        self.assertIn("ValueError: xyz出错了", out)
+
+    def test_preview_rules(self):
+        import agent as agent_mod
+        ok = agent_mod.preview("run_command", "exit_code=0\nhello\nworld")
+        self.assertEqual(ok, ["exit_code=0"])                       # 成功：只一行
+        long_fail = "exit_code=1\n" + "\n".join(f"line{i}" for i in range(30))
+        out = agent_mod.preview("run_command", long_fail)
+        self.assertEqual(out[0], "exit_code=1")
+        self.assertEqual(out[-1], "line29")                         # 保留末尾
+        self.assertLessEqual(len(out), 12)
+        self.assertEqual(agent_mod.preview("read_file", "a\nb"), ["a"])
+
     def test_max_steps(self):
         a = self.agent([{"tools": [("list_files", {})]}] * 3, max_steps=3)
         a.run_turn("loop")
@@ -316,6 +343,142 @@ class TestCompaction(Base):
         out = memory.compact(FakeClient([{"text": "S"}]), {"model": "x"}, msgs, 1)
         self.assertEqual([m["role"] for m in out], ["user", "user"])
         self.assertIsNone(memory.compact(FakeClient([]), {"model": "x"}, msgs, 5))
+
+
+class TestBadArguments(Base):
+    """回归测试：模型输出被截断 → 参数是半截 JSON → 历史里存了坏数据 → 之后每次请求 400"""
+    def test_truncated_args_stored_as_valid_json_and_model_told(self):
+        a = self.agent([
+            {"raw_tools": [("write_file", '{"path": "tetris.py", "content": "import pygame\\nclass')], "finish": "length"},
+            {"text": "好的，我分段写"},
+        ])
+        a.run_turn("写个俄罗斯方块")
+        for m in a.messages:                                  # 历史里每个参数都必须是合法 JSON
+            for t in m.get("tool_calls") or []:
+                json.loads(t["function"]["arguments"])
+        tool_msg = [m for m in a.messages if m["role"] == "tool"][0]["content"]
+        self.assertIn("截断", tool_msg)
+        self.assertIn("edit_file", tool_msg)
+        self.assertFalse(os.path.exists(self.p("tetris.py")))   # 残缺调用不执行
+        # 发给模型的第二次请求里不能含非法 JSON
+        for m in a.client.calls[1]["messages"]:
+            for t in m.get("tool_calls") or []:
+                json.loads(t["function"]["arguments"])
+
+    def test_bad_json_without_truncation_gets_different_hint(self):
+        a = self.agent([{"raw_tools": [("write_file", "{不是json")]}, {"text": "ok"}])
+        a.run_turn("x")
+        self.assertIn("合法 JSON", [m for m in a.messages if m["role"] == "tool"][0]["content"])
+
+    def test_existing_corrupted_history_is_healed_on_load(self):
+        bad = {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "z", "type": "function", "function": {"name": "write_file", "arguments": '{"path": "a", "con'}}]}
+        with open(self.p("history.jsonl"), "w", encoding="utf-8") as f:
+            for m in ({"role": "user", "content": "q"}, bad,
+                      {"role": "tool", "tool_call_id": "z", "content": "err"},
+                      {"role": "assistant", "content": "done"}):
+                f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        a = self.agent([])
+        self.assertEqual(a.messages[1]["tool_calls"][0]["function"]["arguments"], "{}")
+        self.assertEqual(len(a.messages), 4)                    # 其余内容保留
+        with open(self.p("history.jsonl"), encoding="utf-8") as f:   # 文件也被修复
+            json.loads(json.loads(f.readlines()[1])["tool_calls"][0]["function"]["arguments"])
+
+    def test_plain_text_truncation_notice(self):
+        a = self.agent([{"text": "写到一半", "finish": "length"}])
+        a.run_turn("x")
+        self.assertIn("截断", self.out.getvalue())
+
+
+class TestTextProtocol(Base):
+    def test_parse_basic_and_code_roundtrip(self):
+        code = 'def f():\n    s = "引号\\n"\n    return {"a": 1}\n'
+        block = textproto.render_call("write_file", {"path": "a.py", "content": code})
+        clean, calls, trunc = textproto.parse("我来写文件\n" + block + "\n")
+        self.assertEqual(clean, "我来写文件")
+        self.assertFalse(trunc)
+        self.assertEqual(calls, [("write_file", {"path": "a.py", "content": code})])
+
+    def test_parse_multiple_and_single_line_params(self):
+        text = ('<tool name="read_file"><path>a.py</path></tool>\n'
+                '<tool name="run_command">\n<command>python a.py</command>\n</tool>')
+        _, calls, _ = textproto.parse(text)
+        self.assertEqual(calls, [("read_file", {"path": "a.py"}), ("run_command", {"command": "python a.py"})])
+
+    def test_parse_html_content_with_inner_tags(self):
+        html = "<div><p>hi</p></div>"
+        _, calls, _ = textproto.parse(textproto.render_call("write_file", {"path": "i.html", "content": html}))
+        self.assertEqual(calls[0][1]["content"], html)
+
+    def test_parse_unclosed_is_truncated(self):
+        clean, calls, trunc = textproto.parse('先说两句\n<tool name="write_file">\n<path>a.py</path>\n<content>\nimport')
+        self.assertTrue(trunc)
+        self.assertEqual(calls, [])
+        self.assertEqual(clean, "先说两句")
+
+    def test_to_text_messages(self):
+        msgs = [{"role": "user", "content": "q"},
+                {"role": "assistant", "content": "ok", "tool_calls": [
+                    {"id": "1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a"}'}},
+                    {"id": "2", "type": "function", "function": {"name": "grep", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "1", "content": "R1"},
+                {"role": "tool", "tool_call_id": "2", "content": "R2"},
+                {"role": "assistant", "content": "done"}]
+        out = textproto.to_text_messages(msgs)
+        self.assertEqual([m["role"] for m in out], ["user", "assistant", "user", "assistant"])
+        self.assertIn('<tool name="read_file">', out[1]["content"])
+        self.assertIn('<tool_result name="read_file">', out[2]["content"])
+        self.assertIn('<tool_result name="grep">', out[2]["content"])     # 两个结果合并成一条
+        self.assertFalse(any("tool_calls" in m or m["role"] == "tool" for m in out))
+
+    def test_filter_hides_tool_block_even_if_tag_is_split(self):
+        shown = []
+        f = textproto.TextFilter(shown.append)
+        text = '你好，开始\n<tool name="write_file">\n<path>a</path></tool>'
+        for ch in text:                       # 逐字符喂，覆盖标签被拆开的情况
+            f.feed(ch)
+        f.flush()
+        out = "".join(shown)
+        self.assertIn("你好，开始", out)
+        self.assertNotIn("<path>", out)
+        self.assertNotIn("<tool", out)
+        shown.clear()
+        f2 = textproto.TextFilter(shown.append)
+        for ch in "普通回答，没有工具 <b>粗体</b>":
+            f2.feed(ch)
+        f2.flush()
+        self.assertEqual("".join(shown), "普通回答，没有工具 <b>粗体</b>")
+
+    def test_end_to_end_text_mode(self):
+        block = textproto.render_call("write_file", {"path": "t.py", "content": 'print("方块")\n'})
+        a = self.agent([{"text": "我来创建\n" + block}, {"text": "创建完成"}])
+        a.tool_modes["m"] = "text"
+        a.run_turn("建 t.py")
+        self.assertEqual(self.read("t.py"), 'print("方块")\n')
+        first, second = a.client.calls
+        self.assertNotIn("tools", first)
+        self.assertIn("【工具调用格式】", first["messages"][0]["content"])
+        # 历史仍是原生格式；发给模型的第二次请求里工具结果被转成了文本
+        self.assertEqual([m["role"] for m in a.messages], ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(a.messages[1]["content"], "我来创建")
+        self.assertIn("<tool_result", second["messages"][-1]["content"])
+        self.assertNotIn("<tool name=", self.out.getvalue())          # 终端里看不到原始工具块
+
+    def test_text_mode_truncated_block_gets_retry_hint(self):
+        a = self.agent([{"text": '<tool name="write_file">\n<path>a.py</path>\n<content>\nimport pygame'},
+                        {"text": "好，拆小写"}])
+        a.tool_modes["m"] = "text"
+        a.run_turn("x")
+        self.assertFalse(os.path.exists(self.p("a.py")))
+        self.assertIn("拆小", a.messages[-2]["content"])               # 提示作为用户消息加入
+        self.assertEqual(a.messages[-1]["content"], "好，拆小写")
+
+    def test_toolmode_command(self):
+        a = self.agent([])
+        a.command("/toolmode text")
+        self.assertEqual(a.tool_modes["m"], "text")
+        a.command("/toolmode native")
+        self.assertEqual(a.tool_modes["m"], "native")
 
 
 class TestUserConfig(Base):
@@ -452,6 +615,21 @@ class TestResilience(Base):
         self.assertEqual(llm.classify_error(ConnectionError("x")), "retry")
         self.assertEqual(llm.classify_error(ValueError("bug")), "fatal")
 
+    def test_classify_midstream_upstream_errors(self):
+        """回归：流式传输中途的上游过载错误没有 status_code，旧版误判为 fatal，既不重试也不换模型"""
+        class OpenAIStyleError(Exception):
+            pass
+        OpenAIStyleError.__module__ = "openai._exceptions"
+        e = OpenAIStyleError("Upstream error from Nvidia: Service temporarily overloaded")
+        self.assertEqual(llm.classify_error(e), "retry")
+        e.code = 502                                                    # 只带 code 的情况
+        self.assertEqual(llm.classify_error(e), "retry")
+        self.assertEqual(llm.classify_error(OpenAIStyleError("something odd")), "retry")
+        self.assertEqual(llm.classify_error(ApiError(404, "This model is unavailable for free")), "switch")
+        self.assertEqual(llm.classify_error(ApiError(400, "Provider returned error")), "switch")
+        self.assertEqual(llm.classify_error(ApiError(401, "No auth credentials")), "fatal")
+        self.assertEqual(llm.classify_error(KeyError("bug")), "fatal")
+
     def agent2(self, script, **kw):
         a = self.agent(script, retries=2, retry_wait=1, fallback_models=["n"], **kw)
         self.sleeps = []
@@ -465,6 +643,29 @@ class TestResilience(Base):
         self.assertEqual([c["model"] for c in a.client.calls], ["a:free"] * 3)
         self.assertEqual(a.messages[-1]["content"], "好了")
 
+    def test_overloaded_midstream_retried_then_fallback(self):
+        class StreamErr(Exception):
+            pass
+        StreamErr.__module__ = "openai"
+        err = StreamErr("Upstream error from Nvidia: Service temporarily overloaded")
+        a = self.agent2([{"error": err}] * 3 + [{"text": "备用模型接手"}])
+        a.run_turn("hi")
+        self.assertEqual(self.sleeps, [1, 2])
+        self.assertEqual(a.client.calls[-1]["model"], "b:free")
+
+    def test_continue_after_failure_keeps_tool_result(self):
+        """请求失败后，历史以工具结果结尾仍然合法，输入"继续"即可接着干"""
+        a = self.agent2([{"tools": [("write_file", {"path": "g.py", "content": "x=1"})]},
+                         {"error": ApiError(401, "boom")}, {"text": "接着做"}])
+        a.safe_turn("写 g.py")
+        self.assertEqual(a.messages[-1]["role"], "tool")
+        a.safe_turn("继续")
+        self.assertEqual(a.messages[-1]["content"], "接着做")
+
+    def test_prompt_warns_about_gui_programs(self):
+        import agent as agent_mod
+        self.assertIn("弹窗口", agent_mod.BASE_PROMPT)
+
     def test_fallback_after_retries_exhausted(self):
         a = self.agent2([{"error": ApiError(429)}] * 3 + [{"text": "备用成功"}])
         a.run_turn("hi")
@@ -472,11 +673,19 @@ class TestResilience(Base):
         self.assertEqual(a.current, "m")                           # 不改变用户选择
         self.assertIn("备用模型 n", self.out.getvalue())
 
-    def test_no_tool_support_switches_immediately(self):
-        a = self.agent2([{"error": ApiError(404, "No endpoints support tool use")}, {"text": "ok"}])
+    def test_no_tool_support_falls_back_to_text_protocol(self):
+        a = self.agent2([{"error": ApiError(404, "No endpoints found that support tool use")}, {"text": "ok"}])
         a.run_turn("hi")
         self.assertEqual(self.sleeps, [])
-        self.assertEqual([c["model"] for c in a.client.calls], ["a:free", "b:free"])
+        self.assertEqual([c["model"] for c in a.client.calls], ["a:free", "a:free"])  # 同一模型
+        self.assertIn("tools", a.client.calls[0])
+        self.assertNotIn("tools", a.client.calls[1])                                  # 第二次走文本协议
+        self.assertEqual(a.tool_modes["m"], "text")
+
+    def test_invalid_json_error_is_not_mistaken_for_no_tool_support(self):
+        e = ApiError(400, "messages[16].tool_calls[0].function.arguments must be a valid JSON")
+        self.assertFalse(llm.tools_unsupported(e))
+        self.assertTrue(llm.tools_unsupported(ApiError(404, "No endpoints found that support tool use")))
 
     def test_fatal_not_retried(self):
         a = self.agent2([{"error": ApiError(401, "bad key")}])
